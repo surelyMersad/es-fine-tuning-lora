@@ -24,21 +24,18 @@ parser.add_argument('--hf_cache_dir', type=str, default='hf_cache')
 parser.add_argument('--precision', type=str, default='bf16')
 parser.add_argument('--gpu_threads', type=int, default=4, help='Number of parallel threads per GPU')
 parser.add_argument('--verbose', action='store_true', help='Print verbose logs')
-parser.add_argument('--aggressive_gc', action='store_true', help='Perform aggressive garbage collection')
-parser.add_argument('--eval_interval', type=int, default=20, help='Interval for evaluating best/worst models')
-parser.add_argument('--visualization_dir', type=str, default='./visualizations', help='Directory for saving visualizations')
-parser.add_argument('--weight_sample_interval', type=int, default=10, help='Sample interval for weight tracking')
 parser.add_argument('--data_sample', type=int, default=1000, help='Number of data samples to use for training')
 args = parser.parse_args()
 
 
-NUM_ITERATIONS = 1000              # Number of ES iterations (generations)
-POPULATION_SIZE = 30              # Population size (number of mutants per iteration)
-SIGMA = 0.001                     # Standard deviation for weight perturbations (choose carefully)
+# Hyperparameters for ES
+NUM_ITERATIONS = 1000             # Number of ES iterations (generations)
+POPULATION_SIZE = 30              # Population size (number of perturbations per iteration)
+SIGMA = 0.001                     # Standard deviation for weight perturbations (noise scale)
 ALPHA = 0.0005                    # Learning rate
-max_new_tokens = 1024
-do_sample = False
-initial_seed = 33
+max_new_tokens = 1024              # Maximum number of tokens allowed to be generated
+do_sample = False                 # Whether sampling is allowed in generating tokens, default to be not allowed (greedy decoding for ES)
+initial_seed = 33                 # Initial random seed
 
 
 # Import countdown reward function
@@ -50,13 +47,13 @@ data_path = os.path.join(os.path.dirname(__file__), 'data/countdown/countdown_sa
 if os.path.exists(data_path):
     with open(data_path, 'r') as f:
         data_json = json.load(f)
-    
+
     dataset = []
     for item in data_json:
         context = item['context']
         target = item['target']
         dataset.append((context, target))
-    
+
     # Use a subset of the dataset for training
     dataset = dataset[:args.data_sample]
     print(f"Loaded {len(dataset)} countdown samples from {data_path}")
@@ -123,14 +120,14 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
             if start_idx != -1 and end_idx != -1:
                 numbers_str = inp_text[start_idx+1:end_idx]
                 numbers = [int(n) for n in numbers_str.split() if n.isdigit()]
-        
+
         if tgt_text.isdigit():
             target = int(tgt_text)
-        
+
         model_response = gen_text
         if "assistant:" in gen_text:
             model_response = gen_text.split("assistant:")[-1].strip()
-        
+
         # Use reward_function from countdown_task.py
         reward_result = reward_function(model_response, numbers, target)
         reward = reward_result["reward"]
@@ -210,8 +207,6 @@ def main():
         print(f"Total processes: {accelerator.num_processes}, GPU threads per process: {args.gpu_threads}")
         print(f"Population size: {POPULATION_SIZE}, Iterations: {NUM_ITERATIONS}")
         print(f"Sigma: {SIGMA}, Alpha: {ALPHA}")
-        print(f"Aggressive GC: {args.aggressive_gc}")
-        print(f"Visualization directory: {args.visualization_dir}")
 
     # Load model
     model_name = args.model_name
@@ -269,7 +264,8 @@ def main():
             seeds_tensor = torch.zeros(POPULATION_SIZE, dtype=torch.long, device=accelerator.device)
 
         # Broadcast seeds from main process to all processes
-        torch.distributed.broadcast(seeds_tensor, src=0)
+        if accelerator.num_processes>1:
+            torch.distributed.broadcast(seeds_tensor, src=0)
         seeds = seeds_tensor.cpu().tolist()  # Convert back to list for all processes
 
         if args.verbose:
@@ -315,7 +311,8 @@ def main():
             all_rewards[seed_idx] = reward
 
         # Aggregate rewards from all processes (each process will get the full reward list)
-        torch.distributed.all_reduce(all_rewards, op=torch.distributed.ReduceOp.SUM)
+        if accelerator.num_processes>1:
+            torch.distributed.all_reduce(all_rewards, op=torch.distributed.ReduceOp.SUM)
 
         # Convert aggregated rewards back to Python list
         rewards = all_rewards.cpu().tolist()
@@ -375,7 +372,7 @@ def main():
         if accelerator.is_main_process:
             print(f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_time:.2f}s, Mean: {mean_reward:.2f}, Min: {min_reward:.2f}, Max: {max_reward:.2f}")
             print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.2f}MB allocated, {torch.cuda.max_memory_allocated() / 1024**2:.2f}MB peak")
-            
+
             # Save checkpoint every 100 iterations
             if (iteration + 1) % 100 == 0:
                 save_model_checkpoint(original_model, tokenizer, iteration + 1, model_name, initial_seed, args, len(dataset))
@@ -392,7 +389,6 @@ def main():
         original_model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
         print(f"Final model saved successfully.")
-        print(f"Visualizations saved to {args.visualization_dir}")
 
 if __name__ == "__main__":
     os.environ["PYTHONWARNINGS"] = "ignore"
