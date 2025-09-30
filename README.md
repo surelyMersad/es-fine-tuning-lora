@@ -51,3 +51,20 @@ accelerate launch \
 - `--hf_cache_dir`: Directory for HuggingFace cache
 - `--precision`: Model precision, default to be `bf16`
 - `--verbose`: Enable detailed logging if this argument is present in the command line
+
+
+## Citation
+
+If you find this work helpful in your research, please cite:
+
+```bibtex
+@misc{qiu2025evolutionstrategiesscalellm,
+      title={Evolution Strategies at Scale: LLM Fine-Tuning Beyond Reinforcement Learning}, 
+      author={Xin Qiu and Yulu Gan and Conor F. Hayes and Qiyao Liang and Elliot Meyerson and Babak Hodjat and Risto Miikkulainen},
+      year={2025},
+      eprint={2509.24372},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2509.24372}, 
+}
+```
