@@ -23,7 +23,6 @@ accelerate launch \
     --num_processes 2 \
     --num_machines 1 \
     --machine_rank 0 \
-    --gpu_ids 0,1 \
     es_fine-tuning_conciseness.py \
     --gpu_threads=2 \
     --model_name=Qwen/Qwen2.5-7B-Instruct
@@ -37,7 +36,6 @@ accelerate launch \
     --num_processes 4 \
     --num_machines 1\
     --machine_rank 0 \
-    --mixed_precision bf16 \
     countdown/es_fine-tuning_countdown.py \
     --data_sample 200 \
     --model_name Qwen/Qwen2.5-3B-Instruct \
