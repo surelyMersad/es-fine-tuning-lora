@@ -282,6 +282,10 @@ def main():
     if accelerator.is_main_process:
         print(f"Loaded {len(dataset)} countdown samples from {data_path}")
 
+    # Define model parameters early for wandb
+    model_name = args.model_name
+    hf_cache_dir = args.hf_cache_dir
+
     if accelerator.is_main_process:
         print(f"Total processes: {accelerator.num_processes}, GPU threads per process: {args.gpu_threads}")
         print(f"Population size: {POPULATION_SIZE}, Iterations: {NUM_ITERATIONS}")
@@ -313,8 +317,6 @@ def main():
             print(f"Wandb initialized: {wandb.run.url}")
 
     # Load model
-    model_name = args.model_name
-    hf_cache_dir = args.hf_cache_dir
 
     if accelerator.is_main_process:
         print(f"Loading model {model_name}...")
