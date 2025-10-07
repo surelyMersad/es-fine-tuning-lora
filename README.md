@@ -44,7 +44,7 @@ accelerate launch \
 
 ## Other Parameters
 
-- `--gpu_ids`: Specify which GPUs to use (CUDA device id)
+- `--gpu_ids`: Specify which GPUs to use (CUDA device id), argument for `accelerate launch`
 - `--model_name`: HuggingFace model to fine-tune
 - `--hf_cache_dir`: Directory for HuggingFace cache
 - `--precision`: Model precision, default to be `bf16`
