@@ -357,7 +357,6 @@ def main():
 
         # Convert rewards to a tensor and normalize.
         rewards_tensor = np.array(rewards, dtype=np.float32)
-        rewards_normalized = (reards_tensor := rewards_tensor)  # small alias trick
         rewards_normalized = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
 
         if args.verbose:
