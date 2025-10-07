@@ -43,7 +43,7 @@ from countdown_task import reward_function
 print("Using countdown reward function")
 
 # --- Load Dataset from JSON File ---
-data_path = os.path.join(os.path.dirname(__file__), 'data/countdown/countdown_samples.json')
+data_path = os.path.join(os.path.dirname(__file__), 'data/countdown/countdown.json')
 if os.path.exists(data_path):
     with open(data_path, 'r') as f:
         data_json = json.load(f)
