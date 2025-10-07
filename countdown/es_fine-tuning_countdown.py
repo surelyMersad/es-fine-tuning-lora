@@ -1,22 +1,23 @@
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.utils import logging
-import numpy as np
-import copy
-import os
 import argparse
-from accelerate import Accelerator
-import time
-import torch.multiprocessing as mp
-import threading
-from queue import Queue
-from concurrent.futures import ThreadPoolExecutor
-import math
+import copy
 import gc
 import json
+import math
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 
+import numpy as np
+import torch
+import torch.multiprocessing as mp
+import wandb
+from accelerate import Accelerator
 # === LoRA / PEFT ===
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, TaskType, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.utils import logging
 
 logging.set_verbosity_error()
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -28,6 +29,10 @@ parser.add_argument('--precision', type=str, default='bf16')
 parser.add_argument('--gpu_threads', type=int, default=4, help='Number of parallel threads per GPU')
 parser.add_argument('--verbose', action='store_true', help='Print verbose logs')
 parser.add_argument('--data_sample', type=int, default=1000, help='Number of data samples to use for training')
+parser.add_argument('--use_wandb', action='store_true', help='Enable Weights & Biases logging')
+parser.add_argument('--wandb_project', type=str, default='es-fine-tuning-countdown', help='Wandb project name')
+parser.add_argument('--wandb_run_name', type=str, default=None, help='Wandb run name (default: auto-generated)')
+parser.add_argument('--track_flops', action='store_true', help='Track FLOPs for forward passes')
 args = parser.parse_args()
 
 # Hyperparameters for ES
@@ -48,6 +53,7 @@ LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_
 
 # Import countdown reward function
 from countdown_task import reward_function
+
 print("Using countdown reward function")
 
 # Dataset will be loaded in main function
@@ -59,6 +65,34 @@ def force_memory_cleanup():
         torch.cuda.ipc_collect()
         torch.cuda.synchronize()
 
+def estimate_generation_flops(model, input_length, output_length, batch_size=1):
+    """
+    Estimate FLOPs for autoregressive generation.
+    
+    For transformer models:
+    - Each forward pass through a token position ≈ 2 * num_params FLOPs
+    - For generation: we do (input_length + output_length) forward passes
+    - Each subsequent token requires attending to all previous tokens
+    
+    Conservative estimate: 2 * num_params * total_sequence_length * batch_size
+    """
+    # Count trainable + non-trainable parameters
+    num_params = sum(p.numel() for p in model.parameters())
+    
+    # Average sequence length during generation (prefill + decode)
+    # Prefill: input_length tokens in parallel
+    # Decode: output_length tokens sequentially, each attending to growing context
+    prefill_flops = 2 * num_params * input_length * batch_size
+    
+    # For autoregressive decode, each token attends to input_length + i tokens
+    decode_flops = 0
+    for i in range(output_length):
+        context_length = input_length + i
+        decode_flops += 2 * num_params * context_length * batch_size
+    
+    total_flops = prefill_flops + decode_flops
+    return total_flops
+
 def save_model_checkpoint(model, tokenizer, iteration, model_name, initial_seed, args, dataset_size):
     """Save LoRA adapter checkpoint at specified iteration"""
     question_num = dataset_size
@@ -69,7 +103,7 @@ def save_model_checkpoint(model, tokenizer, iteration, model_name, initial_seed,
     tokenizer.save_pretrained(save_dir)
     print(f"Checkpoint saved successfully.")
 
-def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_idx=None, thread_id=None, verbose=False, return_text=False):
+def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_idx=None, thread_id=None, verbose=False, return_text=False, track_flops=False):
     """
     Generate a response from the model given an input (single or batch) and compute rewards.
     """
@@ -90,6 +124,10 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
     )
     input_ids = tokenized_inputs["input_ids"].to(accelerator.device)
     attention_mask = tokenized_inputs["attention_mask"].to(accelerator.device)
+    
+    input_length = input_ids.shape[1]
+    batch_size = input_ids.shape[0]
+    
     with torch.inference_mode():
         outputs = model.generate(
             input_ids,
@@ -101,6 +139,12 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize(accelerator.device)
+
+    # Calculate FLOPs if requested
+    flops = 0
+    if track_flops:
+        output_length = outputs.shape[1] - input_length
+        flops = estimate_generation_flops(model, input_length, output_length, batch_size)
 
     # Decode batch outputs
     generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -135,13 +179,19 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
         rewards.append(reward)
 
     if return_text:
-        return rewards, generated_texts
+        if track_flops:
+            return rewards, generated_texts, flops
+        else:
+            return rewards, generated_texts
     else:
-        return rewards
+        if track_flops:
+            return rewards, flops
+        else:
+            return rewards
 
 def process_seed(seed_args):
     """Function to process a single seed, used for thread pool"""
-    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset = seed_args
+    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset, track_flops = seed_args
 
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
@@ -167,10 +217,17 @@ def process_seed(seed_args):
     # Evaluate all prompts with perturbed weights in batch
     input_texts = [input_text for input_text, _ in dataset]
     target_texts = [target_text for _, target_text in dataset]
-    rewards = evaluate_model(
+    eval_result = evaluate_model(
         model, tokenizer, input_texts, target_texts, accelerator,
-        seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False
+        seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False, track_flops=track_flops
     )
+    
+    if track_flops:
+        rewards, flops = eval_result
+    else:
+        rewards = eval_result
+        flops = 0
+    
     total_reward = sum(rewards)
 
     # Restore original weights (subtract the same noise) for trainable params
@@ -197,7 +254,10 @@ def process_seed(seed_args):
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} completed seed {seed_idx} with reward {average_reward:.4f}")
 
-    return seed_idx, average_reward
+    if track_flops:
+        return seed_idx, average_reward, flops
+    else:
+        return seed_idx, average_reward
 
 # --- Main Evolution Strategies Loop ---
 def main():
@@ -222,14 +282,41 @@ def main():
     if accelerator.is_main_process:
         print(f"Loaded {len(dataset)} countdown samples from {data_path}")
 
+    # Define model parameters early for wandb
+    model_name = args.model_name
+    hf_cache_dir = args.hf_cache_dir
+
     if accelerator.is_main_process:
         print(f"Total processes: {accelerator.num_processes}, GPU threads per process: {args.gpu_threads}")
         print(f"Population size: {POPULATION_SIZE}, Iterations: {NUM_ITERATIONS}")
         print(f"Sigma: {SIGMA}, Alpha: {ALPHA}")
+        
+        # Initialize wandb
+        if args.use_wandb:
+            wandb_run_name = args.wandb_run_name or f"es_{model_name.replace('/', '_')}_pop{POPULATION_SIZE}_sigma{SIGMA}_alpha{ALPHA}_seed{initial_seed}"
+            wandb.init(
+                project=args.wandb_project,
+                name=wandb_run_name,
+                config={
+                    "model_name": model_name,
+                    "population_size": POPULATION_SIZE,
+                    "num_iterations": NUM_ITERATIONS,
+                    "sigma": SIGMA,
+                    "alpha": ALPHA,
+                    "max_new_tokens": max_new_tokens,
+                    "initial_seed": initial_seed,
+                    "lora_r": LORA_R,
+                    "lora_alpha": LORA_ALPHA,
+                    "lora_dropout": LORA_DROPOUT,
+                    "precision": args.precision,
+                    "gpu_threads": args.gpu_threads,
+                    "num_gpus": accelerator.num_processes,
+                    "data_samples": len(dataset),
+                }
+            )
+            print(f"Wandb initialized: {wandb.run.url}")
 
     # Load model
-    model_name = args.model_name
-    hf_cache_dir = args.hf_cache_dir
 
     if accelerator.is_main_process:
         print(f"Loading model {model_name}...")
@@ -274,6 +361,9 @@ def main():
 
     # Record total training start time
     training_start_time = time.time()
+    
+    # Initialize FLOPs tracking
+    total_flops = 0
 
     np.random.seed(initial_seed)
 
@@ -318,6 +408,7 @@ def main():
 
         # Process seeds in smaller batches to reduce memory pressure
         local_rewards = []
+        local_flops = []
         batch_size = max(1, min(args.gpu_threads, len(local_seeds)))
 
         for batch_start in range(0, len(local_seeds), batch_size):
@@ -328,12 +419,18 @@ def main():
                 # Prepare thread arguments
                 thread_args = []
                 for thread_id, (seed_idx, seed) in enumerate(batch_seeds):
-                    # Pass verbose flag as argument to process_seed function
-                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose, dataset))
+                    # Pass verbose flag and track_flops as arguments to process_seed function
+                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose, dataset, args.track_flops))
 
                 # Execute in parallel and collect results
                 results = list(executor.map(process_seed, thread_args))
-                local_rewards.extend(results)
+                
+                if args.track_flops:
+                    for seed_idx, reward, flops in results:
+                        local_rewards.append((seed_idx, reward))
+                        local_flops.append((seed_idx, flops))
+                else:
+                    local_rewards.extend(results)
 
             # Clean up between batches
             force_memory_cleanup()
@@ -353,6 +450,21 @@ def main():
         rewards = all_rewards.cpu().tolist()
         # Clean up no longer needed tensor
         del all_rewards
+        
+        # Collect FLOPs from all processes if tracking
+        iter_flops = 0
+        if args.track_flops:
+            all_flops = torch.zeros(POPULATION_SIZE, device=accelerator.device, dtype=torch.float64)
+            for seed_idx, flops in local_flops:
+                all_flops[seed_idx] = flops
+            
+            if accelerator.num_processes > 1:
+                torch.distributed.all_reduce(all_flops, op=torch.distributed.ReduceOp.SUM)
+            
+            iter_flops = all_flops.sum().item()
+            total_flops += iter_flops
+            del all_flops
+        
         force_memory_cleanup()
 
         # Convert rewards to a tensor and normalize.
@@ -411,7 +523,30 @@ def main():
         force_memory_cleanup()
 
         if accelerator.is_main_process:
-            print(f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_time:.2f}s, Mean: {mean_reward:.2f}, Min: {min_reward:.2f}, Max: {max_reward:.2f}")
+            flops_str = ""
+            if args.track_flops:
+                flops_str = f", FLOPs: {iter_flops/1e12:.2f}T"
+            print(f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_time:.2f}s, Mean: {mean_reward:.2f}, Min: {min_reward:.2f}, Max: {max_reward:.2f}{flops_str}")
+            
+            # Log to wandb
+            if args.use_wandb:
+                log_dict = {
+                    "iteration": iteration + 1,
+                    "reward/mean": mean_reward,
+                    "reward/min": min_reward,
+                    "reward/max": max_reward,
+                    "reward/std": rewards_tensor.std().item(),
+                    "time/iteration_seconds": iter_time,
+                }
+                if args.track_flops:
+                    log_dict["compute/iteration_tflops"] = iter_flops / 1e12
+                    log_dict["compute/cumulative_tflops"] = total_flops / 1e12
+                    log_dict["compute/tflops_per_second"] = (iter_flops / 1e12) / iter_time
+                if torch.cuda.is_available():
+                    log_dict["memory/gpu_allocated_mb"] = torch.cuda.memory_allocated() / 1024**2
+                    log_dict["memory/gpu_peak_mb"] = torch.cuda.max_memory_allocated() / 1024**2
+                wandb.log(log_dict)
+            
             if torch.cuda.is_available():
                 print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.2f}MB allocated, {torch.cuda.max_memory_allocated() / 1024**2:.2f}MB peak")
 
@@ -424,6 +559,20 @@ def main():
     # Save the final model
     if accelerator.is_main_process:
         print(f"Training completed in {total_time:.2f}s ({total_time/60:.2f} minutes)")
+        if args.track_flops:
+            print(f"Total FLOPs: {total_flops/1e12:.2f} TFLOPs")
+            print(f"Average TFLOPs/s: {(total_flops/1e12)/total_time:.2f}")
+        
+        if args.use_wandb:
+            log_dict = {
+                "time/total_training_seconds": total_time, 
+                "time/total_training_minutes": total_time/60
+            }
+            if args.track_flops:
+                log_dict["compute/total_tflops"] = total_flops / 1e12
+                log_dict["compute/average_tflops_per_second"] = (total_flops / 1e12) / total_time
+            wandb.log(log_dict)
+        
         question_num = len(dataset)
         save_dir = f"{model_name}_es_random_seed{initial_seed}_pop{POPULATION_SIZE}_iter{NUM_ITERATIONS}_sigma{SIGMA}_alpha{ALPHA}_{args.precision}_threads{args.gpu_threads}_question_num{question_num}_final"
         print(f"Saving final model to {save_dir}...")
@@ -436,6 +585,9 @@ def main():
             original_model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
         print(f"Final model saved successfully.")
+        
+        if args.use_wandb:
+            wandb.finish()
 
 if __name__ == "__main__":
     os.environ["PYTHONWARNINGS"] = "ignore"
