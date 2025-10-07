@@ -42,21 +42,7 @@ initial_seed = 33                 # Initial random seed
 from countdown_task import reward_function
 print("Using countdown reward function")
 
-# --- Load Dataset from JSON File ---
-data_path = os.path.join(os.path.dirname(__file__), 'data/countdown.json')
-if os.path.exists(data_path):
-    with open(data_path, 'r') as f:
-        data_json = json.load(f)
-
-    dataset = []
-    for item in data_json:
-        context = item['context']
-        target = item['target']
-        dataset.append((context, target))
-
-    # Use a subset of the dataset for training
-    dataset = dataset[:args.data_sample]
-    print(f"Loaded {len(dataset)} countdown samples from {data_path}")
+# Dataset will be loaded in main function
 
 def force_memory_cleanup():
     gc.collect()
@@ -141,7 +127,7 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
 
 def process_seed(seed_args):
     """Function to process a single seed, used for thread pool"""
-    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose = seed_args
+    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset = seed_args
 
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
@@ -202,6 +188,25 @@ def process_seed(seed_args):
 # --- Main Evolution Strategies Loop ---
 def main():
     accelerator = Accelerator()
+
+    # --- Load Dataset from JSON File ---
+    data_path = os.path.join(os.path.dirname(__file__), 'data/countdown.json')
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Dataset file not found: {data_path}")
+    
+    with open(data_path, 'r') as f:
+        data_json = json.load(f)
+
+    dataset = []
+    for item in data_json:
+        context = item['context']
+        target = item['target']
+        dataset.append((context, target))
+
+    # Use a subset of the dataset for training
+    dataset = dataset[:args.data_sample]
+    if accelerator.is_main_process:
+        print(f"Loaded {len(dataset)} countdown samples from {data_path}")
 
     if accelerator.is_main_process:
         print(f"Total processes: {accelerator.num_processes}, GPU threads per process: {args.gpu_threads}")
@@ -294,7 +299,7 @@ def main():
                 thread_args = []
                 for thread_id, (seed_idx, seed) in enumerate(batch_seeds):
                     # Pass verbose flag as argument to process_seed function
-                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose))
+                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose, dataset))
 
                 # Execute in parallel and collect results
                 results = list(executor.map(process_seed, thread_args))
