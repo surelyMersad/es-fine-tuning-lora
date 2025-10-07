@@ -1,4 +1,4 @@
-# es-fine-tuning-Lora
+# es-fine-tuning-LoRA
 This repo contains the implementation for running the existing ES loop introduced in  the paper "Evolution Strategies at Scale: LLM Fine-Tuning Beyond Reinforcement Learning" (https://arxiv.org/abs/2509.24372) only over LoRA parameters. Evolution strategies (ES) is used to directly optimize billions of parameters of large language models (LLMs).
 
 Note: we are still actively adding more experimental codes into this repo.
