@@ -15,6 +15,9 @@ import math
 import gc
 import json
 
+# === LoRA / PEFT ===
+from peft import LoraConfig, get_peft_model, TaskType
+
 logging.set_verbosity_error()
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -27,16 +30,21 @@ parser.add_argument('--verbose', action='store_true', help='Print verbose logs')
 parser.add_argument('--data_sample', type=int, default=1000, help='Number of data samples to use for training')
 args = parser.parse_args()
 
-
 # Hyperparameters for ES
 NUM_ITERATIONS = 1000             # Number of ES iterations (generations)
 POPULATION_SIZE = 30              # Population size (number of perturbations per iteration)
 SIGMA = 0.001                     # Standard deviation for weight perturbations (noise scale)
 ALPHA = 0.0005                    # Learning rate
-max_new_tokens = 1024              # Maximum number of tokens allowed to be generated
-do_sample = False                 # Whether sampling is allowed in generating tokens, default to be not allowed (greedy decoding for ES)
+max_new_tokens = 1024             # Maximum number of tokens allowed to be generated
+do_sample = False                 # Greedy decoding for ES
 initial_seed = 33                 # Initial random seed
 
+# === LoRA hyperparams ===
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05
+# Qwen/LLaMA-style module names
+LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 # Import countdown reward function
 from countdown_task import reward_function
@@ -52,10 +60,11 @@ def force_memory_cleanup():
         torch.cuda.synchronize()
 
 def save_model_checkpoint(model, tokenizer, iteration, model_name, initial_seed, args, dataset_size):
-    """Save model checkpoint at specified iteration"""
+    """Save LoRA adapter checkpoint at specified iteration"""
     question_num = dataset_size
     save_dir = f"{model_name}_es_random_seed{initial_seed}_pop{POPULATION_SIZE}_iter{iteration}_sigma{SIGMA}_alpha{ALPHA}_{args.precision}_threads{args.gpu_threads}_question_num{question_num}_checkpoint"
     print(f"Saving checkpoint at iteration {iteration} to {save_dir}...")
+    # For PeftModel this saves adapters only (desired)
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
     print(f"Checkpoint saved successfully.")
@@ -72,27 +81,31 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
     input_texts = input_text if is_batch else [input_text]
     target_texts = target_text if is_batch else [target_text]
 
-    # Batch tokenization
-    tokenized_inputs = tokenizer(input_texts, return_tensors="pt", padding=True, padding_side="left")
+    # Batch tokenization (left pad set globally on tokenizer)
+    tokenized_inputs = tokenizer(
+        input_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    )
     input_ids = tokenized_inputs["input_ids"].to(accelerator.device)
     attention_mask = tokenized_inputs["attention_mask"].to(accelerator.device)
     with torch.inference_mode():
-        outputs = model.generate(input_ids, attention_mask=attention_mask, max_new_tokens=max_new_tokens, do_sample=do_sample)
+        outputs = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize(accelerator.device)
 
     # Decode batch outputs
-    generated_texts = []
-    for i in range(len(input_texts)):
-        try:
-            generated_text = tokenizer.decode(outputs[i], skip_special_tokens=True)
-        except TypeError:
-            tokens = tokenizer.convert_ids_to_tokens(outputs[i], skip_special_tokens=True)
-            filtered = [t for t in tokens if t is not None]
-            generated_text = tokenizer.convert_tokens_to_string(filtered)
-        generated_texts.append(generated_text)
+    generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-    del input_ids, outputs
+    del input_ids, outputs, attention_mask, tokenized_inputs
     torch.cuda.empty_cache()
 
     # Compute rewards for batch texts
@@ -107,8 +120,10 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
                 numbers_str = inp_text[start_idx+1:end_idx]
                 numbers = [int(n) for n in numbers_str.split() if n.isdigit()]
 
-        if tgt_text.isdigit():
+        if isinstance(tgt_text, str) and tgt_text.isdigit():
             target = int(tgt_text)
+        elif isinstance(tgt_text, int):
+            target = tgt_text
 
         model_response = gen_text
         if "assistant:" in gen_text:
@@ -118,7 +133,6 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
         reward_result = reward_function(model_response, numbers, target)
         reward = reward_result["reward"]
         rewards.append(reward)
-
 
     if return_text:
         return rewards, generated_texts
@@ -132,12 +146,12 @@ def process_seed(seed_args):
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
 
-    # Put load-evaluate-restore in the same lock block for thread safety
+    # Apply noise ONLY to trainable (LoRA) params
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
         gen = torch.Generator(device=param.device)
-
         gen.manual_seed(int(seed))
-
         noise = torch.randn(
             param.shape,
             generator=gen,
@@ -153,16 +167,18 @@ def process_seed(seed_args):
     # Evaluate all prompts with perturbed weights in batch
     input_texts = [input_text for input_text, _ in dataset]
     target_texts = [target_text for _, target_text in dataset]
-    rewards = evaluate_model(model, tokenizer, input_texts, target_texts, accelerator,
-                           seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False)
+    rewards = evaluate_model(
+        model, tokenizer, input_texts, target_texts, accelerator,
+        seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False
+    )
     total_reward = sum(rewards)
 
-    # Restore original weights (direct inplace modification)
+    # Restore original weights (subtract the same noise) for trainable params
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
         gen = torch.Generator(device=param.device)
-
         gen.manual_seed(int(seed))
-
         noise = torch.randn(
             param.shape,
             generator=gen,
@@ -176,14 +192,12 @@ def process_seed(seed_args):
 
     average_reward = total_reward / len(dataset)
 
-
     force_memory_cleanup()
 
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} completed seed {seed_idx} with reward {average_reward:.4f}")
 
     return seed_idx, average_reward
-
 
 # --- Main Evolution Strategies Loop ---
 def main():
@@ -220,25 +234,41 @@ def main():
     if accelerator.is_main_process:
         print(f"Loading model {model_name}...")
 
+    # Load tokenizer once and set padding
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, cache_dir=hf_cache_dir)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
-    # Load model on main process first then sync
+    # === Build LoRA config once ===
+    lora_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        lora_dropout=LORA_DROPOUT,
+        target_modules=LORA_TARGET_MODULES,
+        bias="none",
+        inference_mode=False,
+    )
+
+    # Load base model per thread, wrap with LoRA, eval mode for deterministic ES
     model_list = []
     for model_index in range(args.gpu_threads):
-        model_list.append(AutoModelForCausalLM.from_pretrained(
+        base = AutoModelForCausalLM.from_pretrained(
             model_name,
             cache_dir=hf_cache_dir,
             device_map={"": accelerator.process_index},  # Assign devices explicitly
             torch_dtype=torch.float16 if args.precision == 'fp16' else (torch.bfloat16 if args.precision == 'bf16' else torch.float32),
-        ))
-        # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, cache_dir=hf_cache_dir)
+        )
+        model = get_peft_model(base, lora_cfg)  # wrap with LoRA
+        model.eval()
+        # Optionally print trainable params once
+        # if accelerator.is_main_process and model_index == 0:
+        #     model.print_trainable_parameters()
+        model_list.append(model)
 
     if accelerator.is_main_process:
         print("Model loaded successfully")
-
-    # Prepare model with accelerator
-    for model in model_list:
-        model.eval()  # Turn off dropout, etc.
 
     force_memory_cleanup()
 
@@ -269,7 +299,7 @@ def main():
             seeds_tensor = torch.zeros(POPULATION_SIZE, dtype=torch.long, device=accelerator.device)
 
         # Broadcast seeds from main process to all processes
-        if accelerator.num_processes>1:
+        if accelerator.num_processes > 1:
             torch.distributed.broadcast(seeds_tensor, src=0)
         seeds = seeds_tensor.cpu().tolist()  # Convert back to list for all processes
 
@@ -316,7 +346,7 @@ def main():
             all_rewards[seed_idx] = reward
 
         # Aggregate rewards from all processes (each process will get the full reward list)
-        if accelerator.num_processes>1:
+        if accelerator.num_processes > 1:
             torch.distributed.all_reduce(all_rewards, op=torch.distributed.ReduceOp.SUM)
 
         # Convert aggregated rewards back to Python list
@@ -327,37 +357,44 @@ def main():
 
         # Convert rewards to a tensor and normalize.
         rewards_tensor = np.array(rewards, dtype=np.float32)
+        rewards_normalized = (reards_tensor := rewards_tensor)  # small alias trick
         rewards_normalized = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
-
 
         if args.verbose:
             print(f"Process {accelerator.process_index} updating model weights")
+
+        # === ES update ONLY on trainable (LoRA) params ===
         original_model = model_list[0]
         for name, param in original_model.named_parameters():
+            if not param.requires_grad:
+                continue
             gen = torch.Generator(device=param.device)
             update = torch.zeros_like(param)
             for seed_idx in range(POPULATION_SIZE):
                 r_norm = rewards_normalized[seed_idx]
                 seed = seeds[seed_idx]
                 gen.manual_seed(int(seed))
-
                 noise = torch.randn(
                     param.shape,
                     generator=gen,
                     device=param.device,
                     dtype=param.dtype
                 )
-                noise.mul_(float(r_norm))
-                update.add_(noise)
+                update.add_(noise.mul(float(r_norm)))
                 del noise
             update.div_(POPULATION_SIZE)
             param.data.add_(ALPHA * update)
+            del update
             torch.cuda.empty_cache()
 
+        # Sync LoRA adapters to sibling thread models (only trainable params)
         for model_idx in range(1, len(model_list)):
-            original_model_tmp = model_list[model_idx]
-            for name, param in original_model_tmp.named_parameters():
-                param.data.copy_(original_model.get_parameter(name).data.clone())
+            dst = model_list[model_idx]
+            # copy by name
+            src_named = dict(original_model.named_parameters())
+            for n_dst, p_dst in dst.named_parameters():
+                if p_dst.requires_grad:
+                    p_dst.data.copy_(src_named[n_dst].data)
 
         # Synchronize to ensure weight updates are complete
         if torch.cuda.is_available():
@@ -376,22 +413,28 @@ def main():
 
         if accelerator.is_main_process:
             print(f"Iteration {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_time:.2f}s, Mean: {mean_reward:.2f}, Min: {min_reward:.2f}, Max: {max_reward:.2f}")
-            print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.2f}MB allocated, {torch.cuda.max_memory_allocated() / 1024**2:.2f}MB peak")
+            if torch.cuda.is_available():
+                print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.2f}MB allocated, {torch.cuda.max_memory_allocated() / 1024**2:.2f}MB peak")
 
-            # Save checkpoint every 100 iterations
+            # Save checkpoint every 100 iterations (adapters only)
             if (iteration + 1) % 100 == 0:
                 save_model_checkpoint(original_model, tokenizer, iteration + 1, model_name, initial_seed, args, len(dataset))
 
     total_time = time.time() - training_start_time
 
-
-    # Save the final fine-tuned model weights.
+    # Save the final model
     if accelerator.is_main_process:
         print(f"Training completed in {total_time:.2f}s ({total_time/60:.2f} minutes)")
         question_num = len(dataset)
         save_dir = f"{model_name}_es_random_seed{initial_seed}_pop{POPULATION_SIZE}_iter{NUM_ITERATIONS}_sigma{SIGMA}_alpha{ALPHA}_{args.precision}_threads{args.gpu_threads}_question_num{question_num}_final"
         print(f"Saving final model to {save_dir}...")
-        original_model.save_pretrained(save_dir)
+        # Try to save merged full model; fallback to adapters-only
+        try:
+            merged = original_model.merge_and_unload()  # returns base model with LoRA merged
+            merged.save_pretrained(save_dir)
+        except Exception as e:
+            print(f"merge_and_unload failed ({e}); saving adapters only.")
+            original_model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
         print(f"Final model saved successfully.")
 
