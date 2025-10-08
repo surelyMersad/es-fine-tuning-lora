@@ -33,6 +33,7 @@ parser.add_argument('--use_wandb', action='store_true', help='Enable Weights & B
 parser.add_argument('--wandb_project', type=str, default='es-fine-tuning-countdown', help='Wandb project name')
 parser.add_argument('--wandb_run_name', type=str, default=None, help='Wandb run name (default: auto-generated)')
 parser.add_argument('--track_flops', action='store_true', help='Track FLOPs for forward passes')
+parser.add_argument('--use_lora', action='store_true', default=True, help='Use LoRA for fine-tuning (default: True)')
 args = parser.parse_args()
 
 # Hyperparameters for ES
@@ -193,7 +194,7 @@ def process_seed(seed_args):
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
 
-    # Apply noise ONLY to trainable (LoRA) params
+    # Apply noise to trainable params (LoRA params if using LoRA, or all params if not)
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -290,26 +291,32 @@ def main():
         
         # Initialize wandb
         if args.use_wandb:
-            wandb_run_name = args.wandb_run_name or f"es_{model_name.replace('/', '_')}_pop{POPULATION_SIZE}_sigma{SIGMA}_alpha{ALPHA}_seed{initial_seed}"
-            wandb.init(
-                project=args.wandb_project,
-                name=wandb_run_name,
-                config={
-                    "model_name": model_name,
-                    "population_size": POPULATION_SIZE,
-                    "num_iterations": NUM_ITERATIONS,
-                    "sigma": SIGMA,
-                    "alpha": ALPHA,
-                    "max_new_tokens": max_new_tokens,
-                    "initial_seed": initial_seed,
+            lora_suffix = "_lora" if args.use_lora else "_full"
+            wandb_run_name = args.wandb_run_name or f"es_{model_name.replace('/', '_')}_pop{POPULATION_SIZE}_sigma{SIGMA}_alpha{ALPHA}_seed{initial_seed}{lora_suffix}"
+            config_dict = {
+                "model_name": model_name,
+                "population_size": POPULATION_SIZE,
+                "num_iterations": NUM_ITERATIONS,
+                "sigma": SIGMA,
+                "alpha": ALPHA,
+                "max_new_tokens": max_new_tokens,
+                "initial_seed": initial_seed,
+                "use_lora": args.use_lora,
+                "precision": args.precision,
+                "gpu_threads": args.gpu_threads,
+                "num_gpus": accelerator.num_processes,
+                "data_samples": len(dataset),
+            }
+            if args.use_lora:
+                config_dict.update({
                     "lora_r": LORA_R,
                     "lora_alpha": LORA_ALPHA,
                     "lora_dropout": LORA_DROPOUT,
-                    "precision": args.precision,
-                    "gpu_threads": args.gpu_threads,
-                    "num_gpus": accelerator.num_processes,
-                    "data_samples": len(dataset),
-                }
+                })
+            wandb.init(
+                project=args.wandb_project,
+                name=wandb_run_name,
+                config=config_dict
             )
             print(f"Wandb initialized: {wandb.run.url}")
 
@@ -324,18 +331,20 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    # === Build LoRA config once ===
-    lora_cfg = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        target_modules=LORA_TARGET_MODULES,
-        bias="none",
-        inference_mode=False,
-    )
+    # === Build LoRA config once (if using LoRA) ===
+    lora_cfg = None
+    if args.use_lora:
+        lora_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=LORA_R,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            target_modules=LORA_TARGET_MODULES,
+            bias="none",
+            inference_mode=False,
+        )
 
-    # Load base model per thread, wrap with LoRA, eval mode for deterministic ES
+    # Load base model per thread, optionally wrap with LoRA, eval mode for deterministic ES
     model_list = []
     for model_index in range(args.gpu_threads):
         base = AutoModelForCausalLM.from_pretrained(
@@ -344,15 +353,27 @@ def main():
             device_map={"": accelerator.process_index},  # Assign devices explicitly
             torch_dtype=torch.float16 if args.precision == 'fp16' else (torch.bfloat16 if args.precision == 'bf16' else torch.float32),
         )
-        model = get_peft_model(base, lora_cfg)  # wrap with LoRA
+        
+        if args.use_lora:
+            model = get_peft_model(base, lora_cfg)  # wrap with LoRA
+        else:
+            model = base  # use full model
+            
         model.eval()
         # Optionally print trainable params once
         # if accelerator.is_main_process and model_index == 0:
-        #     model.print_trainable_parameters()
+        #     if args.use_lora:
+        #         model.print_trainable_parameters()
+        #     else:
+        #         print(f"Full model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
         model_list.append(model)
 
     if accelerator.is_main_process:
         print("Model loaded successfully")
+        if args.use_lora:
+            print(f"Using LoRA with r={LORA_R}, alpha={LORA_ALPHA}, dropout={LORA_DROPOUT}")
+        else:
+            print("Using full model (no LoRA)")
 
     force_memory_cleanup()
 
@@ -475,7 +496,7 @@ def main():
         if args.verbose:
             print(f"Process {accelerator.process_index} updating model weights")
 
-        # === ES update ONLY on trainable (LoRA) params ===
+        # === ES update on trainable params (LoRA params if using LoRA, or all params if not) ===
         original_model = model_list[0]
         for name, param in original_model.named_parameters():
             if not param.requires_grad:
@@ -499,7 +520,7 @@ def main():
             del update
             torch.cuda.empty_cache()
 
-        # Sync LoRA adapters to sibling thread models (only trainable params)
+        # Sync trainable params to sibling thread models
         for model_idx in range(1, len(model_list)):
             dst = model_list[model_idx]
             # copy by name
@@ -578,12 +599,17 @@ def main():
         question_num = len(dataset)
         save_dir = f"{model_name}_es_random_seed{initial_seed}_pop{POPULATION_SIZE}_iter{NUM_ITERATIONS}_sigma{SIGMA}_alpha{ALPHA}_{args.precision}_threads{args.gpu_threads}_question_num{question_num}_final"
         print(f"Saving final model to {save_dir}...")
-        # Try to save merged full model; fallback to adapters-only
-        try:
-            merged = original_model.merge_and_unload()  # returns base model with LoRA merged
-            merged.save_pretrained(save_dir)
-        except Exception as e:
-            print(f"merge_and_unload failed ({e}); saving adapters only.")
+        # Save model based on whether LoRA was used
+        if args.use_lora:
+            # Try to save merged full model; fallback to adapters-only
+            try:
+                merged = original_model.merge_and_unload()  # returns base model with LoRA merged
+                merged.save_pretrained(save_dir)
+            except Exception as e:
+                print(f"merge_and_unload failed ({e}); saving adapters only.")
+                original_model.save_pretrained(save_dir)
+        else:
+            # Save full model directly
             original_model.save_pretrained(save_dir)
         tokenizer.save_pretrained(save_dir)
         print(f"Final model saved successfully.")
