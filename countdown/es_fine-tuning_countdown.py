@@ -518,6 +518,7 @@ def main():
         mean_reward = rewards_tensor.mean().item()
         min_reward = rewards_tensor.min().item()
         max_reward = rewards_tensor.max().item()
+        std_reward = rewards_tensor.std().item()
 
         del rewards_tensor, rewards_normalized
         force_memory_cleanup()
@@ -535,7 +536,7 @@ def main():
                     "reward/mean": mean_reward,
                     "reward/min": min_reward,
                     "reward/max": max_reward,
-                    "reward/std": rewards_tensor.std().item(),
+                    "reward/std": std_reward,
                     "time/iteration_seconds": iter_time,
                 }
                 if args.track_flops:
