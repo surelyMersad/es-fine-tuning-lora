@@ -65,7 +65,7 @@ def force_memory_cleanup():
         torch.cuda.ipc_collect()
         torch.cuda.synchronize()
 
-def estimate_generation_flops(model, input_length, output_length, batch_size=1):
+def estimate_generation_flops(num_params, input_length, output_length, batch_size=1):
     """
     Estimate FLOPs for autoregressive generation.
     
@@ -74,21 +74,18 @@ def estimate_generation_flops(model, input_length, output_length, batch_size=1):
     - For generation: we do (input_length + output_length) forward passes
     - Each subsequent token requires attending to all previous tokens
     
-    Conservative estimate: 2 * num_params * total_sequence_length * batch_size
+    Uses closed-form formula for efficiency.
     """
-    # Count trainable + non-trainable parameters
-    num_params = sum(p.numel() for p in model.parameters())
-    
-    # Average sequence length during generation (prefill + decode)
     # Prefill: input_length tokens in parallel
-    # Decode: output_length tokens sequentially, each attending to growing context
     prefill_flops = 2 * num_params * input_length * batch_size
     
-    # For autoregressive decode, each token attends to input_length + i tokens
-    decode_flops = 0
-    for i in range(output_length):
-        context_length = input_length + i
-        decode_flops += 2 * num_params * context_length * batch_size
+    # Decode: output_length tokens sequentially, each attending to growing context
+    # Sum of (input_length + i) for i in range(output_length)
+    # = output_length * input_length + sum(0 to output_length-1)
+    # = output_length * input_length + output_length * (output_length - 1) / 2
+    decode_flops = 2 * num_params * batch_size * (
+        output_length * input_length + output_length * (output_length - 1) // 2
+    )
     
     total_flops = prefill_flops + decode_flops
     return total_flops
@@ -103,7 +100,7 @@ def save_model_checkpoint(model, tokenizer, iteration, model_name, initial_seed,
     tokenizer.save_pretrained(save_dir)
     print(f"Checkpoint saved successfully.")
 
-def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_idx=None, thread_id=None, verbose=False, return_text=False, track_flops=False):
+def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_idx=None, thread_id=None, verbose=False, return_text=False, track_flops=False, num_params=None):
     """
     Generate a response from the model given an input (single or batch) and compute rewards.
     """
@@ -142,9 +139,9 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
 
     # Calculate FLOPs if requested
     flops = 0
-    if track_flops:
+    if track_flops and num_params is not None:
         output_length = outputs.shape[1] - input_length
-        flops = estimate_generation_flops(model, input_length, output_length, batch_size)
+        flops = estimate_generation_flops(num_params, input_length, output_length, batch_size)
 
     # Decode batch outputs
     generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -191,7 +188,7 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
 
 def process_seed(seed_args):
     """Function to process a single seed, used for thread pool"""
-    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset, track_flops = seed_args
+    seed_idx, seed, model, tokenizer, accelerator, thread_id, verbose, dataset, track_flops, num_params = seed_args
 
     if verbose:
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
@@ -219,7 +216,7 @@ def process_seed(seed_args):
     target_texts = [target_text for _, target_text in dataset]
     eval_result = evaluate_model(
         model, tokenizer, input_texts, target_texts, accelerator,
-        seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False, track_flops=track_flops
+        seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False, track_flops=track_flops, num_params=num_params
     )
     
     if track_flops:
@@ -364,6 +361,10 @@ def main():
     
     # Initialize FLOPs tracking
     total_flops = 0
+    # Cache parameter count for FLOPs calculation (compute once, reuse)
+    num_params = sum(p.numel() for p in model_list[0].parameters()) if args.track_flops else None
+    if args.track_flops and accelerator.is_main_process:
+        print(f"Model has {num_params/1e9:.2f}B parameters")
 
     np.random.seed(initial_seed)
 
@@ -419,8 +420,8 @@ def main():
                 # Prepare thread arguments
                 thread_args = []
                 for thread_id, (seed_idx, seed) in enumerate(batch_seeds):
-                    # Pass verbose flag and track_flops as arguments to process_seed function
-                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose, dataset, args.track_flops))
+                    # Pass verbose flag, track_flops, and num_params as arguments to process_seed function
+                    thread_args.append((seed_idx, seed, model_list[thread_id], tokenizer, accelerator, thread_id, args.verbose, dataset, args.track_flops, num_params))
 
                 # Execute in parallel and collect results
                 results = list(executor.map(process_seed, thread_args))
