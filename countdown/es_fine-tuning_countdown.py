@@ -41,7 +41,7 @@ parser.add_argument('--use_wandb', action='store_true', help='Enable Weights & B
 parser.add_argument('--wandb_project', type=str, default='es-fine-tuning-countdown', help='Wandb project name')
 parser.add_argument('--wandb_run_name', type=str, default=None, help='Wandb run name (default: auto-generated)')
 parser.add_argument('--track_flops', action='store_true', help='Track FLOPs for forward passes')
-parser.add_argument('--use_lora', action='store_true', default=True, help='Use LoRA for fine-tuning (default: True)')
+parser.add_argument('--use_lora', action='store_true', default=False, help='Use LoRA for fine-tuning (default: True)')
 # --- vLLM integration BEGIN ---
 parser.add_argument('--use_vllm_rollouts', action='store_true',
                     help='Use vLLM for batched generation rollouts (HF model remains the one being updated).')
@@ -103,10 +103,14 @@ def _init_vllm(model_name: str, accelerator):
 
 @torch.no_grad()
 def _collect_trainable_named_tensors(hf_model):
+    if args.use_lora:
+        hf_model.merge_adapter()
     items = []
     for n, p in hf_model.named_parameters():
         if p.requires_grad:
             items.append((n, p.detach()))
+    if args.use_lora:
+        hf_model.unmerge_adapter()
     return items
 
 def _sync_hf_to_vllm(hf_model):
@@ -116,7 +120,16 @@ def _sync_hf_to_vllm(hf_model):
     raw = _collect_trainable_named_tensors(hf_model)
     print(f"[DEBUG] Collected {len(raw)} trainable tensors from HF model")
     
-    to_load = raw if vllm_names is None else [(n, t) for (n, t) in raw if n in vllm_names]
+    if vllm_names is not None:
+        print(f"[DEBUG] vLLM has {len(vllm_names)} parameters")
+        # Print first few parameter names for debugging
+        
+        
+        to_load = [(n, t) for (n, t) in raw if n in vllm_names]
+    else:
+        print(f"[DEBUG] vLLM model has no named_parameters, loading all")
+        to_load = raw
+        
     print(f"[DEBUG] Loading {len(to_load)} tensors to vLLM")
 
     # Some builds want list-of-lists; this keeps compatibility minimal
@@ -322,8 +335,13 @@ def process_seed(seed_args):
         if not param.requires_grad:
             continue
         num_params_perturbed += 1
+        
+        # Store original value for debugging
+        original_sum = param.data.sum().item() if verbose and num_params_perturbed == 1 else None
+        
         if verbose and num_params_perturbed <= 3:  # Log first few params for debugging
             print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Perturbing param {name}, shape: {param.shape}, device: {param.device}")
+            print(f"[DEBUG] Original param sum: {original_sum:.6f}")
         
         gen = torch.Generator(device=param.device)
         gen.manual_seed(int(seed))
@@ -334,6 +352,12 @@ def process_seed(seed_args):
             dtype=param.dtype
         )
         param.data.add_(SIGMA * noise)
+        
+        # Log change for first param
+        if verbose and num_params_perturbed == 1:
+            new_sum = param.data.sum().item()
+            noise_sum = noise.sum().item()
+            print(f"[DEBUG] After perturbation - param sum: {new_sum:.6f}, noise sum: {noise_sum:.6f}, change: {new_sum - original_sum:.6f}")
     
     if verbose:
         print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Perturbed {num_params_perturbed} trainable parameters")
@@ -688,8 +712,13 @@ def main():
             if not param.requires_grad:
                 continue
             param_count += 1
+            
+            # Store original value for debugging
+            original_sum = param.data.sum().item() if args.verbose and param_count == 1 else None
+            
             if args.verbose and param_count <= 3:  # Log first few params for debugging
                 print(f"[DEBUG] Process {accelerator.process_index}: Updating param {name}, shape: {param.shape}")
+                print(f"[DEBUG] Original param sum before ES update: {original_sum:.6f}")
             
             gen = torch.Generator(device=param.device)
             update = torch.zeros_like(param)
@@ -707,6 +736,13 @@ def main():
                 del noise
             update.div_(POPULATION_SIZE)
             param.data.add_(ALPHA * update)
+            
+            # Log change for first param
+            if args.verbose and param_count == 1:
+                new_sum = param.data.sum().item()
+                update_sum = update.sum().item()
+                print(f"[DEBUG] After ES update - param sum: {new_sum:.6f}, update sum: {update_sum:.6f}, change: {new_sum - original_sum:.6f}")
+            
             del update
             torch.cuda.empty_cache()
         
