@@ -1,0 +1,57 @@
+{
+  "os": "Linux-5.15.0-136-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.13.7",
+  "startedAt": "2025-10-12T18:02:59.591596Z",
+  "args": [
+    "--use_vllm_rollouts",
+    "--use_lora",
+    "--gpu_threads",
+    "1",
+    "--precision",
+    "bf16",
+    "--hf_cache_dir",
+    "hf_cache",
+    "--data_sample",
+    "1000",
+    "--verbose",
+    "--use_wandb"
+  ],
+  "program": "/home/parsaidp/es-fine-tuning-lora/countdown/es_fine-tuning_countdown.py",
+  "codePath": "countdown/es_fine-tuning_countdown.py",
+  "codePathLocal": "es_fine-tuning_countdown.py",
+  "git": {
+    "remote": "https://github.com/surelyMersad/es-fine-tuning-lora.git",
+    "commit": "6f5ec9154e8c1456538871c41ddf0f10b1f2c816"
+  },
+  "email": "ididea@sas.upenn.edu",
+  "root": "/home/parsaidp/es-fine-tuning-lora/countdown",
+  "host": "GPU389E",
+  "executable": "/home/parsaidp/miniconda/envs/jupyter/bin/python",
+  "cpu_count": 96,
+  "cpu_count_logical": 192,
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "982756397056",
+      "used": "503849758720"
+    }
+  },
+  "memory": {
+    "total": "1081646792704"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA H100 80GB HBM3",
+      "memoryTotal": "85520809984",
+      "cudaCores": 16896,
+      "architecture": "Hopper",
+      "uuid": "GPU-1f29b910-712d-a46f-eb0f-25bf6bb96dc7"
+    }
+  ],
+  "cudaVersion": "12.2",
+  "slurm": {
+    "job_id": "1196893"
+  },
+  "writerId": "6ocgbbmp93lvzkq1bh5702zgov84pxcu"
+}

@@ -105,12 +105,20 @@ def _init_vllm(model_name: str, accelerator):
 def _collect_trainable_named_tensors(hf_model):
     if args.use_lora:
         hf_model.merge_adapter()
+        print(f"[DEBUG] LoRA model merged")
     items = []
     for n, p in hf_model.named_parameters():
-        if p.requires_grad:
+        if not p.requires_grad:
+            # print(f"[DEBUG] Collecting non-trainable param {n}")
+            if args.use_lora:
+                to_cut = len("base_model.model.")
+                n = n[to_cut:]
             items.append((n, p.detach()))
     if args.use_lora:
         hf_model.unmerge_adapter()
+        print(f"[DEBUG] LoRA model unmerged")
+    print(f"[DEBUG] Collected {len(items)} trainable tensors from HF model")
+    # print(f"[DEBUG] Items: {items}")
     return items
 
 def _sync_hf_to_vllm(hf_model):
@@ -341,7 +349,7 @@ def process_seed(seed_args):
         
         if verbose and num_params_perturbed <= 3:  # Log first few params for debugging
             print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Perturbing param {name}, shape: {param.shape}, device: {param.device}")
-            print(f"[DEBUG] Original param sum: {original_sum:.6f}")
+            print(f"[DEBUG] Original param sum: {original_sum}")
         
         gen = torch.Generator(device=param.device)
         gen.manual_seed(int(seed))
@@ -357,7 +365,7 @@ def process_seed(seed_args):
         if verbose and num_params_perturbed == 1:
             new_sum = param.data.sum().item()
             noise_sum = noise.sum().item()
-            print(f"[DEBUG] After perturbation - param sum: {new_sum:.6f}, noise sum: {noise_sum:.6f}, change: {new_sum - original_sum:.6f}")
+            print(f"[DEBUG] After perturbation - param sum: {new_sum}, noise sum: {noise_sum}, change: {new_sum - original_sum}")
     
     if verbose:
         print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Perturbed {num_params_perturbed} trainable parameters")
@@ -718,7 +726,7 @@ def main():
             
             if args.verbose and param_count <= 3:  # Log first few params for debugging
                 print(f"[DEBUG] Process {accelerator.process_index}: Updating param {name}, shape: {param.shape}")
-                print(f"[DEBUG] Original param sum before ES update: {original_sum:.6f}")
+                print(f"[DEBUG] Original param sum before ES update: {original_sum}")
             
             gen = torch.Generator(device=param.device)
             update = torch.zeros_like(param)
@@ -741,7 +749,7 @@ def main():
             if args.verbose and param_count == 1:
                 new_sum = param.data.sum().item()
                 update_sum = update.sum().item()
-                print(f"[DEBUG] After ES update - param sum: {new_sum:.6f}, update sum: {update_sum:.6f}, change: {new_sum - original_sum:.6f}")
+                print(f"[DEBUG] After ES update - param sum: {new_sum}, update sum: {update_sum}, change: {new_sum - original_sum}")
             
             del update
             torch.cuda.empty_cache()
