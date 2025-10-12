@@ -114,9 +114,7 @@ def _collect_trainable_named_tensors(hf_model):
                 to_cut = len("base_model.model.")
                 n = n[to_cut:]
             items.append((n, p.detach()))
-    if args.use_lora:
-        hf_model.unmerge_adapter()
-        print(f"[DEBUG] LoRA model unmerged")
+    
     print(f"[DEBUG] Collected {len(items)} trainable tensors from HF model")
     # print(f"[DEBUG] Items: {items}")
     return items
@@ -148,6 +146,9 @@ def _sync_hf_to_vllm(hf_model):
         print(f"[DEBUG] vLLM weight loading failed with list format, trying list-of-lists: {e}")
         VLLM_MODEL.load_weights([[n, t] for (n, t) in to_load])
         print(f"[DEBUG] vLLM weight loading successful (list-of-lists format)")
+    if args.use_lora:
+        hf_model.unmerge_adapter()
+        print(f"[DEBUG] LoRA model unmerged")
 # --- vLLM integration END ---
 
 
