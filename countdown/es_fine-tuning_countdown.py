@@ -18,6 +18,14 @@ from accelerate import Accelerator
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import logging
+# --- vLLM integration BEGIN ---
+try:
+    from vllm import LLM, SamplingParams
+except Exception:
+    LLM = None
+    SamplingParams = None
+# --- vLLM integration END ---
+
 
 logging.set_verbosity_error()
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -34,6 +42,11 @@ parser.add_argument('--wandb_project', type=str, default='es-fine-tuning-countdo
 parser.add_argument('--wandb_run_name', type=str, default=None, help='Wandb run name (default: auto-generated)')
 parser.add_argument('--track_flops', action='store_true', help='Track FLOPs for forward passes')
 parser.add_argument('--use_lora', action='store_true', default=True, help='Use LoRA for fine-tuning (default: True)')
+# --- vLLM integration BEGIN ---
+parser.add_argument('--use_vllm_rollouts', action='store_true',
+                    help='Use vLLM for batched generation rollouts (HF model remains the one being updated).')
+# --- vLLM integration END ---
+
 args = parser.parse_args()
 
 # Hyperparameters for ES
@@ -51,6 +64,71 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 # Qwen/LLaMA-style module names
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# --- vLLM integration BEGIN ---
+USE_VLLM = args.use_vllm_rollouts
+VLLM_LLM = None
+VLLM_MODEL = None
+VLLM_SAMPLING = None
+VLLM_LOCK = threading.Lock()  # serialize weight loads + generate calls
+
+def _init_vllm(model_name: str, accelerator):
+    """
+    Initialize a single vLLM engine per process, matching Accelerate ranks.
+    """
+    if LLM is None:
+        raise RuntimeError("vLLM is not installed but --use_vllm_rollouts was set.")
+
+    # Align vLLM's distributed executor env with Accelerate ranks
+    os.environ.setdefault('RANK', str(accelerator.process_index))
+    os.environ.setdefault('LOCAL_RANK', str(getattr(accelerator, "local_process_index", accelerator.process_index)))
+    os.environ.setdefault('WORLD_SIZE', str(accelerator.num_processes))
+    os.environ.setdefault('MASTER_ADDR', 'localhost')
+    os.environ.setdefault('MASTER_PORT', '12355')
+
+    llm = LLM(
+        model=model_name,
+        gpu_memory_utilization=0.80,
+        distributed_executor_backend="external_launcher",
+        enable_sleep_mode=True,
+    )
+    sampling = SamplingParams(
+        max_tokens=max_new_tokens,           # reuse your global
+        temperature=0.0 if not do_sample else 1.0,
+        top_p=1.0,
+        n=1
+    )
+    model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    return llm, model, sampling
+
+@torch.no_grad()
+def _collect_trainable_named_tensors(hf_model):
+    items = []
+    for n, p in hf_model.named_parameters():
+        if p.requires_grad:
+            items.append((n, p.detach()))
+    return items
+
+def _sync_hf_to_vllm(hf_model):
+    print(f"[DEBUG] Starting HF to vLLM weight sync...")
+    # Build map of vLLM param names
+    vllm_names = {n for n, _ in VLLM_MODEL.named_parameters()} if hasattr(VLLM_MODEL, "named_parameters") else None
+    raw = _collect_trainable_named_tensors(hf_model)
+    print(f"[DEBUG] Collected {len(raw)} trainable tensors from HF model")
+    
+    to_load = raw if vllm_names is None else [(n, t) for (n, t) in raw if n in vllm_names]
+    print(f"[DEBUG] Loading {len(to_load)} tensors to vLLM")
+
+    # Some builds want list-of-lists; this keeps compatibility minimal
+    try:
+        VLLM_MODEL.load_weights(to_load)
+        print(f"[DEBUG] vLLM weight loading successful (list format)")
+    except Exception as e:
+        print(f"[DEBUG] vLLM weight loading failed with list format, trying list-of-lists: {e}")
+        VLLM_MODEL.load_weights([[n, t] for (n, t) in to_load])
+        print(f"[DEBUG] vLLM weight loading successful (list-of-lists format)")
+# --- vLLM integration END ---
+
 
 # Import countdown reward function
 from countdown_task import reward_function
@@ -113,46 +191,87 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
     input_texts = input_text if is_batch else [input_text]
     target_texts = target_text if is_batch else [target_text]
 
-    # Batch tokenization (left pad set globally on tokenizer)
-    tokenized_inputs = tokenizer(
-        input_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True
-    )
-    input_ids = tokenized_inputs["input_ids"].to(accelerator.device)
-    attention_mask = tokenized_inputs["attention_mask"].to(accelerator.device)
-    
-    input_length = input_ids.shape[1]
-    batch_size = input_ids.shape[0]
-    
-    with torch.inference_mode():
-        outputs = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+    if USE_VLLM:
+        # vLLM takes raw prompts; we DO NOT retokenize for generation.
+        # (We still use tokenizer later for FLOPs estimation if requested.)
+        with torch.inference_mode():
+            # # Ensure engine is awake
+            # try:
+            #     VLLM_LLM.wake_up()
+            # except Exception:
+            #     pass
+
+            outputs = VLLM_LLM.generate(
+                prompts=input_texts,
+                sampling_params=VLLM_SAMPLING,
+                use_tqdm=False
+            )
+            # Each element has .outputs[0].text
+            generated_texts = [o.outputs[0].text if o.outputs else "" for o in outputs]
+
+            # # Optional: nap to free scheduler work
+            # try:
+            #     VLLM_LLM.sleep(level=1)
+            # except Exception:
+            #     pass
+
+        # FLOPs estimate (optional) using tokenizer lengths
+        flops = 0
+        if track_flops and num_params is not None:
+            # Tokenize once to get lengths
+            input_len = tokenizer(input_texts, padding=True, truncation=True, return_tensors="pt")["input_ids"].shape[1]
+            # Rough: tokenize outputs to get length
+            out_tok = tokenizer(generated_texts, padding=True, truncation=True, return_tensors="pt")["input_ids"]
+            output_length = out_tok.shape[1]
+            batch_size = len(input_texts)
+            flops = estimate_generation_flops(num_params, input_len, output_length, batch_size)
+    else:
+        # Original HF path
+        tokenized_inputs = tokenizer(
+            input_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
         )
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(accelerator.device)
+        input_ids = tokenized_inputs["input_ids"].to(accelerator.device)
+        attention_mask = tokenized_inputs["attention_mask"].to(accelerator.device)
 
-    # Calculate FLOPs if requested
-    flops = 0
-    if track_flops and num_params is not None:
-        output_length = outputs.shape[1] - input_length
-        flops = estimate_generation_flops(num_params, input_length, output_length, batch_size)
+        input_length = input_ids.shape[1]
+        batch_size = input_ids.shape[0]
 
-    # Decode batch outputs
-    generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        with torch.inference_mode():
+            outputs = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(accelerator.device)
 
-    del input_ids, outputs, attention_mask, tokenized_inputs
-    torch.cuda.empty_cache()
+        flops = 0
+        if track_flops and num_params is not None:
+            output_length = outputs.shape[1] - input_length
+            flops = estimate_generation_flops(num_params, input_length, output_length, batch_size)
+
+        generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+        del input_ids, outputs, attention_mask, tokenized_inputs
+        torch.cuda.empty_cache()
+
+    
 
     # Compute rewards for batch texts
     rewards = []
     for i, (gen_text, tgt_text, inp_text) in enumerate(zip(generated_texts, target_texts, input_texts)):
+        if verbose and i == 0:  # Log first example for debugging
+            print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Computing reward for example {i}")
+            print(f"[DEBUG] Input: {inp_text[:100]}...")
+            print(f"[DEBUG] Generated: {gen_text[:100]}...")
+            print(f"[DEBUG] Target: {tgt_text}")
+        
         numbers = None
         target = None
         if "[" in inp_text and "]" in inp_text:
@@ -175,6 +294,9 @@ def evaluate_model(model, tokenizer, input_text, target_text, accelerator, seed_
         reward_result = reward_function(model_response, numbers, target)
         reward = reward_result["reward"]
         rewards.append(reward)
+        
+        if verbose and i == 0:  # Log first reward for debugging
+            print(f"[DEBUG] Reward: {reward}, Numbers: {numbers}, Target: {target}")
 
     if return_text:
         if track_flops:
@@ -195,9 +317,14 @@ def process_seed(seed_args):
         print(f"Process {accelerator.process_index} Thread {thread_id} processing seed {seed_idx} (value: {seed})")
 
     # Apply noise to trainable params (LoRA params if using LoRA, or all params if not)
+    num_params_perturbed = 0
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        num_params_perturbed += 1
+        if verbose and num_params_perturbed <= 3:  # Log first few params for debugging
+            print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Perturbing param {name}, shape: {param.shape}, device: {param.device}")
+        
         gen = torch.Generator(device=param.device)
         gen.manual_seed(int(seed))
         noise = torch.randn(
@@ -207,6 +334,9 @@ def process_seed(seed_args):
             dtype=param.dtype
         )
         param.data.add_(SIGMA * noise)
+    
+    if verbose:
+        print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Perturbed {num_params_perturbed} trainable parameters")
 
     # Ensure weights are fully loaded before evaluation
     if torch.cuda.is_available():
@@ -215,10 +345,20 @@ def process_seed(seed_args):
     # Evaluate all prompts with perturbed weights in batch
     input_texts = [input_text for input_text, _ in dataset]
     target_texts = [target_text for _, target_text in dataset]
+
+    if USE_VLLM:
+        # Push *perturbed* weights to vLLM and rollout under a lock
+        if verbose:
+            print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Syncing perturbed weights to vLLM")
+        with VLLM_LOCK:
+            _sync_hf_to_vllm(model)
+
+    
     eval_result = evaluate_model(
         model, tokenizer, input_texts, target_texts, accelerator,
         seed_idx=seed_idx, thread_id=thread_id, verbose=verbose, return_text=False, track_flops=track_flops, num_params=num_params
     )
+
     
     if track_flops:
         rewards, flops = eval_result
@@ -229,9 +369,14 @@ def process_seed(seed_args):
     total_reward = sum(rewards)
 
     # Restore original weights (subtract the same noise) for trainable params
+    num_params_restored = 0
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        num_params_restored += 1
+        if verbose and num_params_restored <= 3:  # Log first few params for debugging
+            print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Restoring param {name}")
+        
         gen = torch.Generator(device=param.device)
         gen.manual_seed(int(seed))
         noise = torch.randn(
@@ -241,9 +386,23 @@ def process_seed(seed_args):
             dtype=param.dtype
         )
         param.data.add_(-SIGMA * noise)
+    
+    if verbose:
+        print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Restored {num_params_restored} trainable parameters")
+    
+   
+    
 
     if torch.cuda.is_available():
         torch.cuda.synchronize(accelerator.device)
+
+    if USE_VLLM:
+        # After restoring HF to baseline, sync baseline back to vLLM
+        if verbose:
+            print(f"[DEBUG] Process {accelerator.process_index} Thread {thread_id}: Syncing restored baseline weights to vLLM")
+        with VLLM_LOCK:
+            _sync_hf_to_vllm(model)
+    
 
     average_reward = total_reward / len(dataset)
 
@@ -347,26 +506,51 @@ def main():
     # Load base model per thread, optionally wrap with LoRA, eval mode for deterministic ES
     model_list = []
     for model_index in range(args.gpu_threads):
+        print(f"[DEBUG] Process {accelerator.process_index}: Loading model {model_index+1}/{args.gpu_threads}")
+        
         base = AutoModelForCausalLM.from_pretrained(
             model_name,
             cache_dir=hf_cache_dir,
             device_map={"": accelerator.process_index},  # Assign devices explicitly
             torch_dtype=torch.float16 if args.precision == 'fp16' else (torch.bfloat16 if args.precision == 'bf16' else torch.float32),
         )
+        print(f"[DEBUG] Process {accelerator.process_index}: Base model loaded, device: {next(base.parameters()).device}")
         
         if args.use_lora:
             model = get_peft_model(base, lora_cfg)  # wrap with LoRA
+            print(f"[DEBUG] Process {accelerator.process_index}: LoRA model wrapped")
         else:
             model = base  # use full model
+            print(f"[DEBUG] Process {accelerator.process_index}: Using full model (no LoRA)")
             
         model.eval()
-        # Optionally print trainable params once
-        # if accelerator.is_main_process and model_index == 0:
-        #     if args.use_lora:
-        #         model.print_trainable_parameters()
-        #     else:
-        #         print(f"Full model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+        print(f"[DEBUG] Process {accelerator.process_index}: Model set to eval mode")
+        
+        # Print trainable params for debugging
+        if accelerator.is_main_process and model_index == 0:
+            if args.use_lora:
+                model.print_trainable_parameters()
+                print(f"[DEBUG] LoRA trainable parameters printed above")
+            else:
+                total_params = sum(p.numel() for p in model.parameters())
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(f"[DEBUG] Full model - Total: {total_params/1e6:.2f}M, Trainable: {trainable_params/1e6:.2f}M")
+        
         model_list.append(model)
+        print(f"[DEBUG] Process {accelerator.process_index}: Model {model_index+1} added to model_list")
+    if USE_VLLM:
+        if accelerator.is_main_process:
+            print("[DEBUG] Initializing vLLM engine for rollouts...")
+        global VLLM_LLM, VLLM_MODEL, VLLM_SAMPLING
+        VLLM_LLM, VLLM_MODEL, VLLM_SAMPLING = _init_vllm(model_name, accelerator)
+        print(f"[DEBUG] Process {accelerator.process_index}: vLLM engine initialized")
+
+        # Optional: prime vLLM with current baseline HF weights (trainable-only)
+        print(f"[DEBUG] Process {accelerator.process_index}: Syncing HF weights to vLLM...")
+        with VLLM_LOCK:
+            _sync_hf_to_vllm(model_list[0])
+        if accelerator.is_main_process:
+            print("[DEBUG] vLLM ready (external launcher) and synced with HF baseline.")
 
     if accelerator.is_main_process:
         print("Model loaded successfully")
@@ -436,8 +620,9 @@ def main():
         for batch_start in range(0, len(local_seeds), batch_size):
             batch_end = min(batch_start + batch_size, len(local_seeds))
             batch_seeds = local_seeds[batch_start:batch_end]
+            max_workers = 1 if USE_VLLM else len(batch_seeds)
 
-            with ThreadPoolExecutor(max_workers=len(batch_seeds)) as executor:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Prepare thread arguments
                 thread_args = []
                 for thread_id, (seed_idx, seed) in enumerate(batch_seeds):
@@ -498,9 +683,14 @@ def main():
 
         # === ES update on trainable params (LoRA params if using LoRA, or all params if not) ===
         original_model = model_list[0]
+        param_count = 0
         for name, param in original_model.named_parameters():
             if not param.requires_grad:
                 continue
+            param_count += 1
+            if args.verbose and param_count <= 3:  # Log first few params for debugging
+                print(f"[DEBUG] Process {accelerator.process_index}: Updating param {name}, shape: {param.shape}")
+            
             gen = torch.Generator(device=param.device)
             update = torch.zeros_like(param)
             for seed_idx in range(POPULATION_SIZE):
@@ -519,19 +709,35 @@ def main():
             param.data.add_(ALPHA * update)
             del update
             torch.cuda.empty_cache()
+        
+        if args.verbose:
+            print(f"[DEBUG] Process {accelerator.process_index}: Updated {param_count} trainable parameters")
 
         # Sync trainable params to sibling thread models
+        if args.verbose:
+            print(f"[DEBUG] Process {accelerator.process_index}: Syncing updated weights to {len(model_list)-1} sibling models")
+        
         for model_idx in range(1, len(model_list)):
             dst = model_list[model_idx]
             # copy by name
             src_named = dict(original_model.named_parameters())
+            synced_params = 0
             for n_dst, p_dst in dst.named_parameters():
                 if p_dst.requires_grad:
                     p_dst.data.copy_(src_named[n_dst].data)
+                    synced_params += 1
+            
+            if args.verbose:
+                print(f"[DEBUG] Process {accelerator.process_index}: Synced {synced_params} params to model {model_idx}")
 
         # Synchronize to ensure weight updates are complete
         if torch.cuda.is_available():
             torch.cuda.synchronize(accelerator.device)
+        if USE_VLLM:
+            if args.verbose:
+                print(f"[DEBUG] Process {accelerator.process_index}: Syncing updated weights to vLLM")
+            with VLLM_LOCK:
+                _sync_hf_to_vllm(original_model)
 
         force_memory_cleanup()
 
